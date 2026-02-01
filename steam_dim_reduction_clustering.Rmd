@@ -1,0 +1,361 @@
+---
+title: "Dimension Reduction and Clustering on the Steam Games Dataset"
+author: "Elizaveta Sokolova"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: kate
+    number_sections: true
+---
+## Dataset
+The dataset used in this project is the Steam Games Dataset by FronkonGames, published under a CC-BY-4.0 license. It contains information on over 110,000 games and was collected automatically using the Steam-Games-Scraper — a tool that queries the Steam Web API to retrieve the full app list and then fetches detailed metadata for each title, filtering out DLCs, soundtracks, and utilities so that only actual games are included. The resulting fields cover a wide range of signals: pricing, platform support, review counts, playtime statistics, peak concurrent users, and estimated ownership ranges.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6.5,
+  fig.align  = "center",
+  out.width  = "100%"
+)
+```
+
+---
+
+## Libraries
+
+```{r libraries}
+# Install (run once if packages are missing):
+# install.packages(c("FactoMineR","factoextra","Rtsne","umap","psych",
+#                    "ggplot2","dplyr","corrplot","gridExtra","RColorBrewer","knitr"))
+library(FactoMineR)     # PCA engine (SVD-based)
+library(factoextra)     # Scree, biplot, contrib plots (ggplot2-based)
+library(psych)          # KMO & Bartlett tests
+library(Rtsne)          # t-SNE
+library(umap)           # UMAP (pure-R naive method — no Python needed)
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(gridExtra)
+library(grid)           # textGrob, gpar (used in grid.arrange titles)
+library(RColorBrewer)
+library(knitr)
+```
+
+---
+
+## Data Loading & Column Diagnosis
+
+```{r load_data}
+df <- read.csv("games.csv", stringsAsFactors = FALSE)
+
+cat("Dimensions:", nrow(df), "rows  ×", ncol(df), "columns\n\n")
+cat("Column names as read from file:\n")
+print(summary(df))
+```
+
+### Renaming
+
+```{r fix_columns}
+# Rename the first 8 columns to match what the data truly contains
+colnames(df) <- gsub("\\.", "_", colnames(df))
+colnames(df)
+```
+
+---
+
+## Data Cleaning & Feature Engineering
+
+### Parse string columns
+
+```{r parse_owners}
+# Estimated_owners: "20000 - 50000"  →  midpoint 35000
+parse_owners <- function(x) {
+  x <- gsub(",", "", as.character(x))
+  
+  parts <- strsplit(x, "\\s*[-–—]\\s*")
+  
+  sapply(parts, function(p) {
+    nums <- suppressWarnings(as.numeric(p))
+    # если есть хотя бы одно число, берём среднее
+    if (any(!is.na(nums))) mean(nums, na.rm = TRUE) else NA_real_
+  }, USE.NAMES = FALSE)
+}
+
+
+df$Owners_numeric <- parse_owners(df$Estimated_owners)
+
+cat("Owners_numeric — sample values:\n")
+df$Owners_numeric <- parse_owners(df$Estimated_owners)
+head(df$Owners_numeric, 10)
+```
+### Filter & group genres
+
+```{r filter_and_group}
+par(mfrow = c(4, 3))
+keep_cols <- c("Peak_CCU", "Price", "DiscountDLC_count",
+               "Positive", "Negative", "Achievements", "Recommendations",
+               "Average_playtime_forever", "Median_playtime_forever",
+               "Owners_numeric", "Mac", "Linux")
+
+feat <- df[, keep_cols]
+
+# ── Binary platform flags ──
+feat$Mac   <- as.integer(as.logical(feat$Mac))
+feat$Linux <- as.integer(as.logical(feat$Linux))
+
+for(col in keep_cols) {
+  hist(feat[[col]], breaks = 50, main = col, xlab = col)
+}
+```
+
+---
+
+## Feature Selection & Log-Transformation
+
+### Why these features?
+
+| Feature | Transform | Rationale |
+|:---|:---:|:---|
+| Peak CCU | log₁ₚ | Peak concurrent users — extreme right skew |
+| Price | none | Pricing; mild skew |
+| DLC Count | log₁ₚ | Ecosystem depth |
+| Positive Reviews | log₁ₚ | Core engagement signal |
+| Negative Reviews | log₁ₚ | Quality / controversy |
+| Achievements | log₁ₚ | Game-design depth |
+| Recommendations | log₁ₚ | Community endorsement |
+| Avg Playtime | log₁ₚ | Player retention |
+| Med Playtime | log₁ₚ | Retention (outlier-robust) |
+| Est. Owners | log₁ₚ | Market reach |
+| Mac | none | Binary platform flag |
+| Linux | none | Binary platform flag |
+
+**Dropped:**
+* `Required_age` — 98.6 % zeros (near-zero variance).
+* `Metacritic score` — 94.7 % zeros.
+* `Windows` — TRUE for 100 % of games (zero variance).
+
+```{r select_and_transform}
+
+# ── log₁ₚ on all skewed continuous columns ──
+skewed <- c("Peak_CCU", "Positive", "Negative", "Recommendations",
+            "Average_playtime_forever", "Median_playtime_forever",
+            "Owners_numeric", "DiscountDLC_count", "Achievements")
+
+feat[, skewed] <- log1p(feat[, skewed])
+
+# ── Clean column names for nicer plots ──
+colnames(feat) <- c("Peak CCU", "Price", "DLC Count",
+                    "Positive", "Negative", "Achievements", "Recommendations",
+                    "Avg Playtime", "Med Playtime", "Est. Owners",
+                    "Mac", "Linux")
+
+cat("Final feature matrix:", nrow(feat), "games  ×", ncol(feat), "features\n\n")
+print(summary(feat))
+```
+
+---
+
+## Correlation Matrix
+
+```{r correlation, fig.height = 8, fig.width = 9}
+cor_mat <- cor(feat, use = "pairwise.complete.obs")
+
+corrplot(cor_mat,
+         method      = "color",
+         col         = colorRampPalette(c("#2166ac", "#f7f7f7", "#b2182b"))(200),
+         tl.cex      = 0.82,
+         tl.col      = "#2c3e50",
+         tl.srt      = 40,
+         addCoef.col = "#2c3e50",
+         number.cex  = 0.60,
+         number.digits = 2,
+         cl.pos      = "r",
+         cl.cex      = 0.72,
+         title       = "Pairwise Correlations  —  Steam Game Features\n(log-transformed where indicated)",
+         mar         = c(0, 0, 2, 0))
+```
+
+> Several feature groups are strongly correlated — *Positive / Recommendations / Est. Owners / Avg & Med Playtime / Peak CCU* form one tight block; *Avg Playtime* and *Med Playtime* are near-duplicates. This redundancy is exactly what PCA is designed to compress.
+
+---
+
+## PCA Validity Test
+
+Before running PCA we should verify that the correlation structure in the data is actually suitable for factor extraction. Two standard tests exist for this:
+
+* **Kaiser-Meyer-Olkin (KMO)** — measures *sampling adequacy*. It checks whether the pairwise correlations are large relative to the partial correlations (i.e., whether the variables share enough common variance to justify reducing them). KMO > 0.6 is acceptable; > 0.8 is good; > 0.9 is excellent.
+
+```{r kmo_bartlett}
+# KMO needs the raw data (not a cor matrix) to compute per-variable MSA.
+kmo_res     <- KMO(feat)
+print(kmo_res)
+```
+
+---
+
+## PCA — Principal Component Analysis {#pca}
+
+### Run PCA
+
+```{r run_pca}
+# FactoMineR's PCA() centres and scales every variable to unit variance automatically.
+res.pca <- PCA(feat, graph = FALSE, scale.unit = TRUE)
+
+# Eigenvalue table — as.data.frame so that $ column access works
+eigen_tbl <- as.data.frame(get_eigenvalue(res.pca))
+
+cat("Eigenvalues & explained variance (all components):\n\n")
+print(round(eigen_tbl, 3))
+```
+
+### Scree Plot
+
+```{r scree_plot, fig.height = 5.5}
+fviz_eig(res.pca,
+         addlabels  = TRUE,
+         ncp        = ncol(feat),
+         barfill    = "#457b9d",
+         barcolor   = "#264653",
+         linecolor  = "#e63946",
+         pointcolor = "#e63946",
+         pointsize  = 3.8,
+         ggtheme    = theme_minimal()) +
+  labs(title = "Scree Plot  —  Variance Explained by Each PC",
+       x     = "Principal Component",
+       y     = "% of Variance") +
+  theme(plot.title = element_text(face  = "bold", size  = 14,
+                                  hjust = 0.5,  color = "#2c3e50"),
+        axis.title = element_text(size = 11, color = "#34495e"))
+```
+
+### Cumulative Explained Variance
+
+```{r cumvar, fig.height = 5}
+cum_var <- eigen_tbl[, 3]   # col 3 = cumulative percentage of variance
+n_pc    <- length(cum_var)
+
+ggplot(data.frame(PC = 1:n_pc, CumVar = cum_var)) +
+  geom_area(aes(x = PC, y = CumVar), fill = "#457b9d", alpha = 0.10) +
+  geom_line(aes(x = PC, y = CumVar), color = "#457b9d", linewidth = 2.2) +
+  geom_point(aes(x = PC, y = CumVar), color = "#e63946", size = 4.2) +
+  # 80 % threshold
+  geom_hline(yintercept = 80, linetype = "dashed",
+             color = "#e63946", linewidth = 1, alpha = 0.65) +
+  geom_text(x = n_pc - 0.4, y = 81.5,
+            label = "80 % threshold", hjust = 1,
+            color = "#e63946", size = 3.1, fontface = "italic") +
+  # value labels
+  geom_text(aes(x = PC, y = CumVar + 1.6),
+            label = paste0(round(cum_var, 1), " %"),
+            hjust = 0.5, size = 2.8, color = "#2c3e50", fontface = "bold") +
+  scale_x_continuous(breaks = 1:n_pc) +
+  scale_y_continuous(limits = c(0, 108)) +
+  labs(title = "Cumulative Explained Variance",
+       x     = "Number of Principal Components",
+       y     = "Cumulative Variance (%)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14,
+                                  hjust = 0.5, color = "#2c3e50"),
+        axis.title = element_text(size = 11, color = "#34495e"))
+```
+
+### Variable Contributions to PC1 & PC2
+
+```{r var_contrib, fig.height = 5.2, fig.width = 11}
+p1 <- fviz_contrib(res.pca, choice = "var", axes = 1,
+                   fill.color = "#457b9d", color = "#264653") +
+  labs(title = "Contributions  →  PC 1") +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 9),
+        plot.title   = element_text(face = "bold", size = 13,
+                                    hjust = 0.5, color = "#2c3e50"))
+
+p2 <- fviz_contrib(res.pca, choice = "var", axes = 2,
+                   fill.color = "#2a9d8f", color = "#264653") +
+  labs(title = "Contributions  →  PC 2") +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 9),
+        plot.title   = element_text(face = "bold", size = 13,
+                                    hjust = 0.5, color = "#2c3e50"))
+
+grid.arrange(p1, p2, ncol = 2,
+             top = textGrob("Variable Contributions to the First Two Principal Components",
+                            gp = gpar(fontsize = 14, fontface = "bold", col = "#2c3e50")))
+```
+
+### Variable Plot  (Correlation Circle)
+
+```{r var_plot, fig.height = 7, fig.width = 8}
+fviz_pca_var(res.pca,
+             col.var       = "cos2",
+             gradient.cols = list("white" = "#eef2f7",
+                                  "blue"  = "#457b9d",
+                                  "red"   = "#e63946"),
+             repel         = TRUE,
+             geom.var      = c("arrow", "text"),
+             ggtheme       = theme_minimal(),
+             legend.position = "bottom") +
+  labs(title    = "PCA  —  Variable Plot  (Correlation Circle)",
+       subtitle = "Colour = cos²  (quality of representation on PC1–PC2)",
+       x = paste0("PC 1  (", round(eigen_tbl[1, 2], 1), " %)"),
+       y = paste0("PC 2  (", round(eigen_tbl[2, 2], 1), " %)")) +
+  theme(plot.title    = element_text(face = "bold", size = 14,
+                                     hjust = 0.5, color = "#2c3e50"),
+        plot.subtitle = element_text(size = 10, color = "grey55", hjust = 0.5),
+        axis.title    = element_text(size = 11, color = "#34495e"))
+
+```
+
+## Clustering
+After considering K-means, hierarchical, and DBSCAN clustering, DBSCAN was chosen as the final method due to its ability to handle skewed engagement metrics and uneven density distribution without assuming spherical cluster shapes.
+
+```{r var_plot2, fig.height = 7, fig.width = 8}
+library(dbscan)
+pca_scores <- as.data.frame(res.pca$ind$coord)
+
+# Lets take first 3 components 
+pca_sub <- scale(pca_scores[,1:3])
+
+kNNdistplot(pca_sub, k = 10)
+```
+
+
+```{r var_plot3, fig.height = 7, fig.width = 8}
+db <- dbscan(pca_sub, eps = 0.28, minPts = 30)
+
+df$Cluster_DBSCAN <- factor(db$cluster)
+
+table(df$Cluster_DBSCAN)
+
+```
+```{r dbscan_cluster_plot, fig.height = 7, fig.width = 8}
+fviz_cluster(list(data = pca_sub[,1:2],
+                  cluster = db$cluster),
+             geom = "point",
+             ellipse = FALSE,
+             ggtheme = theme_minimal(),
+             main = "S Clusters on PCA Space")
+
+```
+
+## Conclusions {#conclusions}
+
+### PCA
+Principal Component Analysis revealed a strong dimensional structure in the dataset.
+
+PC1 is mainly driven by popularity / engagement variables — Peak CCU, Positive Reviews, Recommendations, Estimated Owners, Playtime.
+This component can be interpreted as a “Market Success & Player Engagement” axis.
+
+PC2 is influenced more by game design / ecosystem features
+
+### Clustering
+
+Density-based clustering (DBSCAN) revealed natural groupings of games and isolated outliers without assuming spherical cluster shapes like K-means has due to highly skewed engagement metrics and uneven density distribution in the Steam marketplace. Most games ended up in one large group with similar low engagement.
