@@ -4,13 +4,13 @@ An exploratory analysis of ~70 k Steam titles using PCA, correlation analysis, a
 
 ## Dataset
 The dataset used in this project is the Steam Games Dataset by FronkonGames, published under a CC-BY-4.0 license. It contains information on over 110,000 games and was collected automatically using the Steam-Games-Scraper — a tool that queries the Steam Web API to retrieve the full app list and then fetches detailed metadata for each title, filtering out DLCs, soundtracks, and utilities so that only actual games are included. The resulting fields cover a wide range of signals: pricing, platform support, review counts, playtime statistics, peak concurrent users, and estimated ownership ranges.
-
+Dataset can be downloaded from kaggle: https://www.kaggle.com/datasets/fronkongames/steam-games-dataset?resource=download
 ## What's in here
 
 | File | Description |
 |---|---|
 | `steam_dim_reduction_clustering.Rmd` | Main R Markdown notebook |
-| `games.csv` | Raw dataset |
+| `steam_dim_reduction_clustering.pdf` | The results |
 
 ## How to reproduce
 
