@@ -1,4 +1,4 @@
-# Dimension Reduction on the Steam Games Dataset
+# Dimension Reduction and Clustering on the Steam Games Dataset
 
 An exploratory analysis of ~70 k Steam titles using PCA, correlation analysis, and DBSCAN clustering in R.
 
